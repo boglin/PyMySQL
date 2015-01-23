@@ -849,23 +849,21 @@ class Connection(object):
         """Read an entire "mysql packet" in its entirety from the network
         and return a MysqlPacket type that represents the results.
         """
+        head_struct = struct.Struct("<3BB")
         buff = b''
         while True:
             packet_header = self._read_bytes(4)
             if DEBUG: dump_packet(packet_header)
-            packet_length_bin = packet_header[:3]
 
-            #TODO: check sequence id
-            #  packet_number
-            byte2int(packet_header[3])
+            len_0, len_1, len_2, seq = head_struct.unpack(packet_header)
+            bytes_to_read = len_2 << 0x10 | len_1 << 0x08 | len_0 
 
-            bin_length = packet_length_bin + b'\0'  # pad little-endian number
-            bytes_to_read = struct.unpack('<I', bin_length)[0]
             recv_data = self._read_bytes(bytes_to_read)
             if DEBUG: dump_packet(recv_data)
             buff += recv_data
             if bytes_to_read < MAX_PACKET_LEN:
                 break
+
         packet = packet_type(buff, self.encoding)
         packet.check_error()
         return packet
@@ -961,8 +959,7 @@ class Connection(object):
         if isinstance(self.user, text_type):
             self.user = self.user.encode(self.encoding)
 
-        data_init = (struct.pack('<i', self.client_flag) + struct.pack("<I", 1) +
-                     int2byte(charset_id) + int2byte(0)*23)
+        data_init = struct.pack('<iIB23x', self.client_flag, 1, charset_id)
 
         next_packet = 1
 
