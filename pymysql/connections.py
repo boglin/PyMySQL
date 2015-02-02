@@ -223,8 +223,9 @@ def unpack_uint16(n):
 def unpack_int24(n):
     return struct.unpack('<I', n + b'\0')[0]
 
-def unpack_int32(n):
-    return struct.unpack('<I', n)[0]
+# Unused
+# def unpack_int32(n):
+#     return struct.unpack('<I', n)[0]
 
 def unpack_int64(n):
     return struct.unpack('<Q', n)[0]
@@ -487,9 +488,7 @@ class Connection(object):
     connect().
 
     """
-
     socket = None
-
 
     def __init__(self, host="localhost", user=None, password="",
                  database=None, port=3306, unix_socket=None,
@@ -498,7 +497,8 @@ class Connection(object):
                  client_flag=0, cursorclass=Cursor, init_command=None,
                  connect_timeout=None, ssl=None, read_default_group=None,
                  compress=None, named_pipe=None, no_delay=False,
-                 autocommit=False, db=None, passwd=None, local_infile=False):
+                 autocommit=False, db=None, passwd=None, local_infile=False,
+                 defer_mode=False):
         """
         Establish a connection to the MySQL database. Accepts several
         arguments:
@@ -555,6 +555,9 @@ class Connection(object):
         self.key = None
         self.cert = None
         self.ca = None
+
+        self.__defer_mode = defer_mode
+        self.__deferred = []
 
         if compress or named_pipe:
             raise NotImplementedError("compress and named_pipe arguments are not supported")
@@ -680,6 +683,11 @@ class Connection(object):
         self._set_variables(ac_vars)
 
     def get_autocommit(self):
+
+        # TODO This code should be more descriptive
+        if self.__deferred:
+            self._execute_command(COMMAND.COM_QUERY, "")
+
         return bool(self.server_status &
                     SERVER_STATUS.SERVER_STATUS_AUTOCOMMIT)
 
@@ -708,14 +716,12 @@ class Connection(object):
         sql = self._set_variables_sql(pairs)
         self._execute_query(sql)
 
-    def _execute_query(self, query):
-        """ Execute a query """
-        self._execute_command(COMMAND.COM_QUERY, query)
-        self._read_ok_packet()
-
     def begin(self):
         """Begin transaction."""
-        self._execute_query("BEGIN")
+        if self.__defer_mode:
+            self.__deferred.append("BEGIN")
+        else:
+            self._execute_query("BEGIN")
 
     def commit(self):
         ''' Commit changes to stable storage '''
@@ -845,6 +851,7 @@ class Connection(object):
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         if self.no_delay:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
         return sock
 
     def _connect(self):
@@ -942,6 +949,18 @@ class Connection(object):
             return 0
 
     def _execute_command(self, command, sql):
+
+        deferred_parts = self.__deferred[:]
+
+        if self.__deferred:
+            deferred_sql = ";".join(deferred_parts)
+            self.__deferred = []
+
+            if command == COMMAND.COM_QUERY:
+                sql = deferred_sql + "; " + sql
+            else:
+                self._execute_query(deferred_sql)
+
         if not self.socket:
             raise InterfaceError("(0, '')")
 
@@ -953,30 +972,36 @@ class Connection(object):
         if isinstance(sql, text_type):
             sql = sql.encode(self.encoding)
 
-        try:
-            chunk_size = min(MAX_PACKET_LEN, len(sql) + 1)  # +1 is for command
-        except:
-            import pdb; pdb.set_trace()
+        chunk_size = min(MAX_PACKET_LEN, len(sql) + 1)  # +1 is for command
 
         prelude = struct.pack('<i', chunk_size) + int2byte(command)
         self._write_bytes(prelude + sql[:chunk_size-1])
         if DEBUG: dump_packet(prelude + sql)
 
         if chunk_size < MAX_PACKET_LEN:
-            return
+            pass
+        else:
+            seq_id = 1
+            sql = sql[chunk_size-1:]
+            while True:
+                chunk_size = min(MAX_PACKET_LEN, len(sql))
+                prelude = struct.pack('<i', chunk_size)[:3]
+                data = prelude + int2byte(seq_id%256) + sql[:chunk_size]
+                self._write_bytes(data)
+                if DEBUG: dump_packet(data)
+                sql = sql[chunk_size:]
+                if not sql and chunk_size < MAX_PACKET_LEN:
+                    break
+                seq_id += 1
 
-        seq_id = 1
-        sql = sql[chunk_size-1:]
-        while True:
-            chunk_size = min(MAX_PACKET_LEN, len(sql))
-            prelude = struct.pack('<i', chunk_size)[:3]
-            data = prelude + int2byte(seq_id%256) + sql[:chunk_size]
-            self._write_bytes(data)
-            if DEBUG: dump_packet(data)
-            sql = sql[chunk_size:]
-            if not sql and chunk_size < MAX_PACKET_LEN:
-                break
-            seq_id += 1
+        if command == COMMAND.COM_QUERY:
+            for _ in deferred_parts:
+                self._read_query_result()
+
+    def _execute_query(self, query):
+        """ Execute a query """
+        self._execute_command(COMMAND.COM_QUERY, query)
+        self._read_ok_packet()
 
     def _client_flag_for_features(self):
 
@@ -1060,14 +1085,16 @@ class Connection(object):
         if self.autocommit_mode is not None:
             sql_var.extend(self._autocommit_vars(self.autocommit_mode))
 
-        init_sql = self._set_variables_sql(sql_var)
+        init_sql = [self._set_variables_sql(sql_var)]
 
         if self.init_command is not None:
-            init_sql += "; "
-            init_sql += self.init_command
-            init_sql += "; COMMIT;"
+            init_sql.extend([self.init_command, "COMMIT"])
 
-        self._execute_query(init_sql)
+        if self.__defer_mode:
+            self.__deferred.extend(init_sql)
+        else:
+            sql = ";".join(init_sql)
+            self._execute_query(sql)
 
     # _mysql support
     def thread_id(self):
