@@ -10,6 +10,14 @@ import warnings
 
 __all__ = ["TestConversion", "TestCursor", "TestBulkInserts"]
 
+def _rounded_to_seconds(dt):
+	""" Round datetime to nearest second """
+	if dt.microsecond < 500000:
+		dt = dt - datetime.timedelta(0, 0, dt.microsecond)
+	else:
+		dt = dt + datetime.timedelta(0, 0, 10 ** 6 - dt.microsecond)
+	return dt
+
 
 class TestConversion(base.PyMySQLTestCase):
     def test_datatypes(self):
@@ -27,7 +35,7 @@ class TestConversion(base.PyMySQLTestCase):
             self.assertEqual(v[1:8], r[1:8])
             # mysql throws away microseconds so we need to check datetimes
             # specially. additionally times are turned into timedeltas.
-            self.assertEqual(datetime.datetime(*v[8].timetuple()[:6]), r[8])
+            self.assertEqual(_rounded_to_seconds(v[8]), r[8])
             self.assertEqual(v[9], r[9]) # just timedeltas
             self.assertEqual(datetime.timedelta(0, 60 * (v[10].hour * 60 + v[10].minute)), r[10])
             self.assertEqual(datetime.datetime(*v[-1][:6]), r[-1])
