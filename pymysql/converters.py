@@ -16,12 +16,13 @@ ESCAPE_MAP = {'\0': '\\0', '\n': '\\n', '\r': '\\r', '\032': '\\Z',
               '\'': '\\\'', '"': '\\"', '\\': '\\\\'}
 
 
-def escape_item(val, charset):
+def escape_item(val, charset, type_encoders=None):
     if type(val) in [tuple, list, set]:
         return escape_sequence(val, charset)
     if type(val) is dict:
         return escape_dict(val, charset)
-    encoder = encoders[type(val)]
+    _encoders = type_encoders or encoders
+    encoder = _encoders[type(val)]
     val = encoder(val)
     return val
 
@@ -51,7 +52,6 @@ def escape_object(value):
 
 def escape_int(value):
     return str(value)
-
 
 def escape_float(value):
     return ('%.15g' % value)
