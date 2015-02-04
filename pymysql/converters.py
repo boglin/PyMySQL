@@ -67,7 +67,8 @@ def escape_unicode(value):
     return escape_str(value)
 
 def escape_bytes(value):
-    return "x'%s'" % binascii.hexlify(value).decode(sys.getdefaultencoding())
+    # escape_bytes is calld only on Python 3.
+    return escape_str(value.decode('ascii', 'surrogateescape'))
 
 def escape_None(value):
     return 'NULL'
@@ -76,21 +77,29 @@ def escape_timedelta(obj):
     seconds = int(obj.seconds) % 60
     minutes = int(obj.seconds // 60) % 60
     hours = int(obj.seconds // 3600) % 24 + int(obj.days) * 24
-    return escape_str('%02d:%02d:%02d' % (hours, minutes, seconds))
+    if obj.microseconds:
+        fmt = "'{0:02d}:{1:02d}:{2:02d}.{3:06d}'"
+    else:
+        fmt = "'{0:02d}:{1:02d}:{2:02d}'"
+    return fmt.format(hours, minutes, seconds, obj.microseconds)
 
 def escape_time(obj):
-    s = "%02d:%02d:%02d" % (int(obj.hour), int(obj.minute),
-                            int(obj.second))
     if obj.microsecond:
-        s += ".{0:06}".format(obj.microsecond)
-
-    return escape_str(s)
+        fmt = "'{0.hour:02}:{0.minute:02}:{0.second:02}.{0.microsecond:06}'"
+    else:
+        fmt = "'{0.hour:02}:{0.minute:02}:{0.second:02}'"
+    return fmt.format(obj)
 
 def escape_datetime(obj):
-    return escape_str(obj.isoformat(' '))
+    if obj.microsecond:
+        fmt = "'{0.year:04}-{0.month:02}-{0.day:02} {0.hour:02}:{0.minute:02}:{0.second:02}.{0.microsecond:06}'"
+    else:
+        fmt = "'{0.year:04}-{0.month:02}-{0.day:02} {0.hour:02}:{0.minute:02}:{0.second:02}'"
+    return fmt.format(obj)
 
 def escape_date(obj):
-    return escape_str(obj.isoformat())
+    fmt = "'{0.year:04}-{0.month:02}-{0.day:02}'"
+    return fmt.format(obj)
 
 def escape_struct_time(obj):
     return escape_datetime(datetime.datetime(*obj[:6]))
@@ -254,13 +263,19 @@ def convert_mysql_timestamp(timestamp):
 def convert_set(s):
     return set(s.split(","))
 
-def convert_bit(b):
-    #b = "\x00" * (8 - len(b)) + b # pad w/ zeroes
-    #return struct.unpack(">Q", b)[0]
-    #
-    # the snippet above is right, but MySQLdb doesn't process bits,
-    # so we shouldn't either
-    return b
+
+def through(x):
+    return x
+
+
+#def convert_bit(b):
+#    b = "\x00" * (8 - len(b)) + b # pad w/ zeroes
+#    return struct.unpack(">Q", b)[0]
+#    
+#     the snippet above is right, but MySQLdb doesn't process bits,
+#     so we shouldn't either
+convert_bit = through
+
 
 def convert_characters(connection, field, data):
     field_charset = charset_by_id(field.charsetnr).name
@@ -296,10 +311,6 @@ encoders = {
     time.struct_time: escape_struct_time,
     Decimal: str,
 }
-
-
-def through(x):
-    return x
 
 if not PY2 or JYTHON or IRONPYTHON:
     encoders[bytes] = escape_bytes

@@ -14,6 +14,7 @@ import os
 import socket
 import struct
 import sys
+import warnings
 
 try:
     import ssl
@@ -41,11 +42,13 @@ from .charset import MBLENGTH, charset_by_name, charset_by_id
 from .cursors import Cursor
 from .constants import CLIENT, COMMAND, FIELD_TYPE, SERVER_STATUS
 from .util import byte2int, int2byte
-from .converters import escape_item, encoders, decoders, escape_string
+from .converters import (
+    escape_item, encoders, decoders, escape_string, through)
 from .err import (
     raise_mysql_exception, Warning, Error,
     InterfaceError, DataError, DatabaseError, OperationalError,
     IntegrityError, InternalError, NotSupportedError, ProgrammingError)
+from . import err
 
 _py_version = sys.version_info[:2]
 
@@ -103,10 +106,6 @@ UNSIGNED_CHAR_COLUMN = 251
 UNSIGNED_SHORT_COLUMN = 252
 UNSIGNED_INT24_COLUMN = 253
 UNSIGNED_INT64_COLUMN = 254
-UNSIGNED_CHAR_LENGTH = 1
-UNSIGNED_SHORT_LENGTH = 2
-UNSIGNED_INT24_LENGTH = 3
-UNSIGNED_INT64_LENGTH = 8
 
 DEFAULT_CHARSET = 'latin1'
 
@@ -217,19 +216,6 @@ def _hash_password_323(password):
 def pack_int24(n):
     return struct.pack('<I', n)[:3]
 
-def unpack_uint16(n):
-    return struct.unpack('<H', n[0:2])[0]
-
-def unpack_int24(n):
-    return struct.unpack('<I', n + b'\0')[0]
-
-# Unused
-# def unpack_int32(n):
-#     return struct.unpack('<I', n)[0]
-
-def unpack_int64(n):
-    return struct.unpack('<Q', n)[0]
-
 
 class MysqlPacket(object):
     """Representation of a MySQL response packet.
@@ -293,23 +279,54 @@ class MysqlPacket(object):
         """
         return self._data[position:(position+length)]
 
+    if PY2:
+        def read_uint8(self):
+            result = ord(self._data[self._position])
+            self._position += 1
+            return result
+    else:
+        def read_uint8(self):
+            result = self._data[self._position]
+            self._position += 1
+            return result
+
+    def read_uint16(self):
+        result = struct.unpack_from('<H', self._data, self._position)[0]
+        self._position += 2
+        return result
+
+    def read_uint24(self):
+        low, high = struct.unpack_from('<HB', self._data, self._position)
+        self._position += 3
+        return low + (high << 16)
+
+    def read_uint32(self):
+        result = struct.unpack_from('<I', self._data, self._position)[0]
+        self._position += 4
+        return result
+
+    def read_uint64(self):
+        result = struct.unpack_from('<Q', self._data, self._position)[0]
+        self._position += 8
+        return result
+
     def read_length_encoded_integer(self):
         """Read a 'Length Coded Binary' number from the data buffer.
 
         Length coded numbers can be anywhere from 1 to 9 bytes depending
         on the value of the first byte.
         """
-        c = ord(self.read(1))
+        c = self.read_uint8()
         if c == NULL_COLUMN:
             return None
         if c < UNSIGNED_CHAR_COLUMN:
             return c
         elif c == UNSIGNED_SHORT_COLUMN:
-            return unpack_uint16(self.read(UNSIGNED_SHORT_LENGTH))
+            return self.read_uint16()
         elif c == UNSIGNED_INT24_COLUMN:
-            return unpack_int24(self.read(UNSIGNED_INT24_LENGTH))
+            return self.read_uint24()
         elif c == UNSIGNED_INT64_COLUMN:
-            return unpack_int64(self.read(UNSIGNED_INT64_LENGTH))
+            return self.read_uint64()
 
     def read_length_coded_string(self):
         """Read a 'Length Coded String' from the data buffer.
@@ -322,6 +339,12 @@ class MysqlPacket(object):
         if length is None:
             return None
         return self.read(length)
+
+    def read_struct(self, fmt):
+        s = struct.Struct(fmt)
+        result = s.unpack_from(self._data, self._position)
+        self._position += s.size
+        return result
 
     def is_ok_packet(self):
         return self._data[0:1] == b'\0'
@@ -346,7 +369,7 @@ class MysqlPacket(object):
         if self.is_error_packet():
             self.rewind()
             self.advance(1)  # field_count == error (we already know that)
-            errno = unpack_uint16(self.read(2))
+            errno = self.read_uint16()
             if DEBUG: print("errno =", errno)
             raise_mysql_exception(self._data)
 
@@ -376,13 +399,8 @@ class FieldDescriptorPacket(MysqlPacket):
         self.org_table = self.read_length_coded_string().decode(encoding)
         self.name = self.read_length_coded_string().decode(encoding)
         self.org_name = self.read_length_coded_string().decode(encoding)
-        self.advance(1)  # non-null filler
-        self.charsetnr = struct.unpack('<H', self.read(2))[0]
-        self.length = struct.unpack('<I', self.read(4))[0]
-        self.type_code = byte2int(self.read(1))
-        self.flags = struct.unpack('<H', self.read(2))[0]
-        self.scale = byte2int(self.read(1))  # "decimals"
-        self.advance(2)  # filler (always 0x00)
+        self.charsetnr, self.length, self.type_code, self.flags, self.scale = (
+            self.read_struct('<xHIBHBxx'))
         # 'default' is a length coded binary and is still in the buffer?
         # not used for normal result sets...
 
@@ -426,8 +444,7 @@ class OKPacketWrapper(object):
 
         self.affected_rows = self.packet.read_length_encoded_integer()
         self.insert_id = self.packet.read_length_encoded_integer()
-        self.server_status = struct.unpack('<H', self.packet.read(2))[0]
-        self.warning_count = struct.unpack('<H', self.packet.read(2))[0]
+        self.server_status, self.warning_count = self.read_struct('<HH')
         self.message = self.packet.read_all()
         self.has_next = self.server_status & SERVER_STATUS.SERVER_MORE_RESULTS_EXISTS
 
@@ -449,9 +466,7 @@ class EOFPacketWrapper(object):
                     self.__class__))
 
         self.packet = from_packet
-        from_packet.advance(1)
-        self.warning_count = struct.unpack('<h', from_packet.read(2))[0]
-        self.server_status = struct.unpack('<h', self.packet.read(2))[0]
+        self.warning_count, self.server_status = self.packet.read_struct('<xhh')
         if DEBUG: print("server_status=", self.server_status)
         self.has_next = self.server_status & SERVER_STATUS.SERVER_MORE_RESULTS_EXISTS
 
@@ -645,7 +660,7 @@ class Connection(object):
         ''' Send the quit message and close the socket '''
         if self.socket is None:
             raise Error("Already closed")
-        send_data = struct.pack('<i', 1) + int2byte(COMMAND.COM_QUIT)
+        send_data = struct.pack('<iB', 1, COMMAND.COM_QUIT)
         try:
             self._write_bytes(send_data)
         except Exception:
@@ -869,16 +884,18 @@ class Connection(object):
             # Send initialisation query
             self._send_init_query()
 
-        except Exception as e:
+        except BaseException as e:
             self._rfile = None
             if sock is not None:
                 try:
                     sock.close()
                 except socket.error:
                     pass
-
+            if isinstance(e, err.MySQLError):
+                raise
             raise OperationalError(
-                2003, "Can't connect to MySQL server on %r (%s)" % (self.host, e))
+                2003,
+                "Can't connect to MySQL server on %r (%s)" % (self.host, e))
 
     def _read_packet(self, packet_type=MysqlPacket):
         """Read an entire "mysql packet" in its entirety from the network
@@ -890,8 +907,9 @@ class Connection(object):
             packet_header = self._read_bytes(4)
             if DEBUG: dump_packet(packet_header)
 
-            len_0, len_1, len_2, seq = head_struct.unpack(packet_header)
-            bytes_to_read = len_2 << 0x10 | len_1 << 0x08 | len_0 
+            btrl, btrh, packet_number = struct.unpack('<HBB', packet_header)
+            bytes_to_read = btrl + (btrh << 16)
+            #TODO: check sequence id
 
             recv_data = self._read_bytes(bytes_to_read)
             if DEBUG: dump_packet(recv_data)
@@ -967,6 +985,7 @@ class Connection(object):
         # If the last query was unbuffered, make sure it finishes before
         # sending new commands
         if self._result is not None and self._result.unbuffered_active:
+            warnings.warn("Previous unbuffered result was left incomplete")
             self._result._finish_unbuffered_query()
 
         if isinstance(sql, text_type):
@@ -974,7 +993,7 @@ class Connection(object):
 
         chunk_size = min(MAX_PACKET_LEN, len(sql) + 1)  # +1 is for command
 
-        prelude = struct.pack('<i', chunk_size) + int2byte(command)
+        prelude = struct.pack('<iB', chunk_size, command)
         self._write_bytes(prelude + sql[:chunk_size-1])
         if DEBUG: dump_packet(prelude + sql)
 
@@ -1303,23 +1322,12 @@ class MySQLResult(object):
         self.rows = tuple(rows)
 
     def _read_row_from_packet(self, packet):
-        use_unicode = self.connection.use_unicode
         row = []
-        for field in self.fields:
+        for encoding, converter in self.converters:
             data = packet.read_length_coded_string()
             if data is not None:
-                field_type = field.type_code
-                if use_unicode:
-                    if field_type in TEXT_TYPES:
-                        charset = charset_by_id(field.charsetnr)
-                        if use_unicode and not charset.is_binary:
-                            # TEXTs with charset=binary means BINARY types.
-                            data = data.decode(charset.encoding)
-                    else:
-                        data = data.decode()
-
-                converter = self.connection.decoders.get(field_type)
-                if DEBUG: print("DEBUG: field={}, converter={}".format(field, converter))
+                if encoding is not None:
+                    data = data.decode(encoding)
                 if DEBUG: print("DEBUG: DATA = ", data)
                 if converter is not None:
                     data = converter(data)
@@ -1329,11 +1337,31 @@ class MySQLResult(object):
     def _get_descriptions(self):
         """Read a column descriptor packet for each column in the result."""
         self.fields = []
+        self.converters = []
+        use_unicode = self.connection.use_unicode
         description = []
         for i in range_type(self.field_count):
             field = self.connection._read_packet(FieldDescriptorPacket)
             self.fields.append(field)
             description.append(field.description())
+            field_type = field.type_code
+            if use_unicode:
+                if field_type in TEXT_TYPES:
+                    charset = charset_by_id(field.charsetnr)
+                    if charset.is_binary:
+                        # TEXTs with charset=binary means BINARY types.
+                        encoding = None
+                    else:
+                        encoding = charset.encoding
+                else:
+                    encoding = 'ascii'
+            else:
+                encoding = None
+            converter = self.connection.decoders.get(field_type)
+            if converter is through:
+                converter = None
+            if DEBUG: print("DEBUG: field={}, converter={}".format(field, converter))
+            self.converters.append((encoding, converter))
 
         eof_packet = self.connection._read_packet()
         assert eof_packet.is_eof_packet(), 'Protocol error, expecting EOF'

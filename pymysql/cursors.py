@@ -11,7 +11,7 @@ from . import err
 #: Regular expression for :meth:`Cursor.executemany`.
 #: executemany only suports simple bulk insert.
 #: You can use it to load large dataset.
-RE_INSERT_VALUES = re.compile(r"""INSERT\s.+\sVALUES\s+(\(\s*%s\s*(,\s*%s\s*)*\))\s*\Z""",
+RE_INSERT_VALUES = re.compile(r"""(INSERT\s.+\sVALUES\s+)(\(\s*%s\s*(?:,\s*%s\s*)*\))(\s*(?:ON DUPLICATE.*)?)\Z""",
                               re.IGNORECASE | re.DOTALL)
 
 
@@ -39,12 +39,6 @@ class Cursor(object):
         self._executed = None
         self._result = None
         self._rows = None
-
-    def __del__(self):
-        '''
-        When this gets GC'd close it.
-        '''
-        self.close()
 
     def close(self):
         '''
@@ -145,39 +139,48 @@ class Cursor(object):
 
         m = RE_INSERT_VALUES.match(query)
         if m:
-            q_values = m.group(1).rstrip()
+            q_prefix = m.group(1)
+            q_values = m.group(2).rstrip()
+            q_postfix = m.group(3) or ''
             assert q_values[0] == '(' and q_values[-1] == ')'
-            q_prefix = query[:m.start(1)]
-            return self._do_execute_many(q_prefix, q_values, args,
+            return self._do_execute_many(q_prefix, q_values, q_postfix, args,
                                          self.max_stmt_length,
                                          self._get_db().encoding)
 
         self.rowcount = sum(self.execute(query, arg) for arg in args)
         return self.rowcount
 
-    def _do_execute_many(self, prefix, values, args, max_stmt_length, encoding):
+    def _do_execute_many(self, prefix, values, postfix, args, max_stmt_length, encoding):
         conn = self._get_db()
         escape = self._escape_args
         if isinstance(prefix, text_type):
             prefix = prefix.encode(encoding)
+        if isinstance(postfix, text_type):
+            postfix = postfix.encode(encoding)
         sql = bytearray(prefix)
         args = iter(args)
         v = values % escape(next(args), conn)
         if isinstance(v, text_type):
-            v = v.encode(encoding)
+            if PY2:
+                v = v.encode(encoding)
+            else:
+                v = v.encode(encoding, 'surrogateescape')
         sql += v
         rows = 0
         for arg in args:
             v = values % escape(arg, conn)
             if isinstance(v, text_type):
-                v = v.encode(encoding)
-            if len(sql) + len(v) + 1 > max_stmt_length:
-                rows += self.execute(sql)
+                if PY2:
+                    v = v.encode(encoding)
+                else:
+                    v = v.encode(encoding, 'surrogateescape')
+            if len(sql) + len(v) + len(postfix) + 1 > max_stmt_length:
+                rows += self.execute(sql + postfix)
                 sql = bytearray(prefix)
             else:
                 sql += b','
             sql += v
-        rows += self.execute(sql)
+        rows += self.execute(sql + postfix)
         self.rowcount = rows
         return rows
 
@@ -235,7 +238,7 @@ class Cursor(object):
         ''' Fetch several rows '''
         self._check_executed()
         if self._rows is None:
-            return None
+            return ()
         end = self.rownumber + (size or self.arraysize)
         result = self._rows[self.rownumber:end]
         self.rownumber = min(end, len(self._rows))
@@ -245,7 +248,7 @@ class Cursor(object):
         ''' Fetch all the rows '''
         self._check_executed()
         if self._rows is None:
-            return None
+            return ()
         if self.rownumber:
             result = self._rows[self.rownumber:]
         else:
@@ -396,7 +399,6 @@ class SSCursor(Cursor):
         Fetch all, as per MySQLdb. Pretty useless for large queries, as
         it is buffered. See fetchall_unbuffered(), if you want an unbuffered
         generator version of this method.
-
         """
         return list(self.fetchall_unbuffered())
 
@@ -413,7 +415,6 @@ class SSCursor(Cursor):
 
     def fetchmany(self, size=None):
         """ Fetch many """
-
         self._check_executed()
         if size is None:
             size = self.arraysize
