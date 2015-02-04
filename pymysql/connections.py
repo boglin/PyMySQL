@@ -1087,14 +1087,21 @@ class Connection(object):
 
         init_sql = [self._set_variables_sql(sql_var)]
 
+        potential_multi_init = False
         if self.init_command is not None:
+            potential_multi_init = ";" in self.init_command
             init_sql.extend([self.init_command, "COMMIT"])
 
-        if self.__defer_mode:
+        if self.__defer_mode and not potential_multi_init:
             self.__deferred.extend(init_sql)
         else:
             sql = ";".join(init_sql)
-            self._execute_query(sql)
+            req = self._execute_command(COMMAND.COM_QUERY, sql)
+
+            while True:
+                ok = self._read_ok_packet()
+                if not ok.has_next:
+                    break
 
     # _mysql support
     def thread_id(self):
